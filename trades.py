@@ -6,7 +6,7 @@ Handles loading, saving, and managing trade history.
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 import re
 
 

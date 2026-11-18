@@ -10,6 +10,8 @@ from typing import Optional, Tuple, BinaryIO
 import shutil
 import io
 
+from config import PORTFOLIO_FILE
+from portfolio import PORTFOLIO_EXPORT_HEADERS
 from trades import (
     TRADES_FILE,
     empty_trades,
@@ -43,7 +45,7 @@ def backup_file(file_path: str) -> Optional[str]:
 
 def import_portfolio_excel(
     uploaded_file: BinaryIO,
-    target_path: str = "Portfolio_22012026.xlsx"
+    target_path: str = PORTFOLIO_FILE
 ) -> Tuple[bool, str, Optional[pd.DataFrame]]:
     """
     Import a portfolio Excel file from upload.
@@ -141,45 +143,13 @@ def import_trades_excel(
 
 
 def export_portfolio_excel(df: pd.DataFrame) -> bytes:
-    """
-    Export portfolio DataFrame to Excel bytes for download.
-
-    Args:
-        df: Portfolio DataFrame
-
-    Returns:
-        Excel file as bytes
-    """
+    """Export portfolio DataFrame to Excel bytes for download."""
+    export_df = (
+        df.drop(columns=["yf_ticker", "platform_share"], errors="ignore")
+          .rename(columns=PORTFOLIO_EXPORT_HEADERS)
+    )
     output = io.BytesIO()
-
-    # Prepare export DataFrame
-    export_df = df.copy()
-
-    # Rename columns to user-friendly names
-    column_rename = {
-        "ticker": "Ticker",
-        "quantity": "Qty",
-        "entry_price": "Entry Price",
-        "platform_price": "Price",
-        "platform_value": "Value",
-        "platform_profit": "Profit",
-        "platform_growth": "Growth",
-        "entry_value": "Entry Value",
-    }
-
-    for old, new in column_rename.items():
-        if old in export_df.columns:
-            export_df = export_df.rename(columns={old: new})
-
-    # Remove internal columns
-    cols_to_remove = ["yf_ticker", "platform_share"]
-    for col in cols_to_remove:
-        if col in export_df.columns:
-            export_df = export_df.drop(columns=[col])
-
     export_df.to_excel(output, index=False)
-    output.seek(0)
-
     return output.getvalue()
 
 

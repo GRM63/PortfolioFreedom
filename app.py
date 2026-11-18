@@ -19,11 +19,10 @@ from config import (
     TRADERNET_LOGIN,
     TRADERNET_PASSWORD,
     DATA_SOURCE,
-    TICKER_MAPPING,
     DEFAULT_REFRESH_INTERVAL,
     REFRESH_INTERVALS,
 )
-from portfolio import load_portfolio
+from portfolio import load_portfolio, get_yfinance_ticker
 from market_data import get_price_history
 from trades import load_trades, save_trades, add_trade, get_trades_summary, TRADES_FILE
 from file_manager import (
@@ -40,8 +39,6 @@ from alerts import (
     get_alerts,
     AlertType,
     format_alert_type,
-    get_alert_history,
-    clear_alert_history,
 )
 
 # Page config
@@ -81,11 +78,6 @@ def show_flash():
     message = st.session_state.pop("flash", None)
     if message:
         st.toast(message, icon="✅")
-
-
-def get_yfinance_ticker(ticker: str) -> str:
-    """Convert Freedom ticker to yfinance symbol."""
-    return TICKER_MAPPING.get(ticker, ticker)
 
 
 def format_currency(value: float, currency: str = "EUR") -> str:
@@ -145,8 +137,8 @@ def get_api_client():
     cache_resource (unlike cache_data) returns the *same* object every time
     instead of a copy, which is what we want for a connection/session.
     """
-    from tradernet import TrdernetClient
-    return TrdernetClient(TRADERNET_LOGIN, TRADERNET_PASSWORD)
+    from tradernet import TradernetClient
+    return TradernetClient(TRADERNET_LOGIN, TRADERNET_PASSWORD)
 
 
 @st.cache_data(ttl=30)

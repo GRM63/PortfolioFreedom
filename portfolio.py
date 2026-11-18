@@ -8,6 +8,30 @@ from pathlib import Path
 from typing import Optional
 from config import PORTFOLIO_FILE, TICKER_MAPPING
 
+# Lower-cased Excel header -> internal column name (Freedom platform export)
+PORTFOLIO_COLUMNS = {
+    "ticker": "ticker",
+    "qty": "quantity",
+    "entry price": "entry_price",
+    "price": "platform_price",
+    "value": "platform_value",
+    "share (%)": "platform_share",
+    "profit": "platform_profit",
+    "growth": "platform_growth",
+}
+
+# Internal column name -> header used when exporting
+PORTFOLIO_EXPORT_HEADERS = {
+    "ticker": "Ticker",
+    "quantity": "Qty",
+    "entry_price": "Entry Price",
+    "platform_price": "Price",
+    "platform_value": "Value",
+    "platform_profit": "Profit",
+    "platform_growth": "Growth",
+    "entry_value": "Entry Value",
+}
+
 
 def get_yfinance_ticker(freedom_ticker: str) -> str:
     """Convert Freedom platform ticker to yfinance symbol."""
@@ -39,45 +63,21 @@ def load_portfolio(file_path: Optional[str] = None) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Portfolio file not found: {file_path}")
 
-    # Read Excel file
-    xl = pd.ExcelFile(file_path)
-
-    # Try to find the main portfolio sheet
-    portfolio_sheet = None
-    for name in xl.sheet_names:
-        name_lower = name.lower()
-        if any(keyword in name_lower for keyword in ["portfolio", "holdings", "positions", "summary"]):
-            portfolio_sheet = name
-            break
-
-    if portfolio_sheet is None:
-        portfolio_sheet = xl.sheet_names[0]
-
-    df = pd.read_excel(xl, sheet_name=portfolio_sheet)
+    # `with` closes the file handle as soon as we're done reading
+    with pd.ExcelFile(file_path) as xl:
+        keywords = ("portfolio", "holdings", "positions", "summary")
+        portfolio_sheet = next(
+            (name for name in xl.sheet_names if any(k in name.lower() for k in keywords)),
+            xl.sheet_names[0],
+        )
+        df = pd.read_excel(xl, sheet_name=portfolio_sheet)
 
     # Expected columns: Ticker, Qty, Entry Price, Price, Value, Share (%), Profit, Growth
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower()
 
-    # Direct column mapping for Freedom platform export
-    column_rename = {
-        "ticker": "ticker",
-        "qty": "quantity",
-        "entry price": "entry_price",
-        "price": "platform_price",
-        "value": "platform_value",
-        "share (%)": "platform_share",
-        "profit": "platform_profit",
-        "growth": "platform_growth",
-    }
-
-    # Rename columns that exist
-    rename_map = {}
-    for old_name, new_name in column_rename.items():
-        if old_name in df.columns:
-            rename_map[old_name] = new_name
-
-    df = df.rename(columns=rename_map)
+    # rename() ignores keys that aren't present, so no need to filter first
+    df = df.rename(columns=PORTFOLIO_COLUMNS)
 
     # Clean up data
     df = df.dropna(subset=["ticker"])
