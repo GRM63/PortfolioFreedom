@@ -6,7 +6,7 @@ Handles loading, saving, and managing trade history.
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 import re
 
 
@@ -28,6 +28,117 @@ def parse_currency_value(value: str) -> float:
         return 0.0
 
 
+TRADE_COLUMNS = [
+    "trade_id", "order_id", "timestamp", "ticker", "direction",
+    "price", "quantity", "amount", "fee", "profit",
+]
+
+# Lower-cased source column name -> internal column name.
+# Several aliases are accepted so exports from other tools can be imported.
+COLUMN_ALIASES = {
+    "trade#": "trade_id",
+    "trade_id": "trade_id",
+    "order#": "order_id",
+    "order_id": "order_id",
+    "time": "timestamp",
+    "timestamp": "timestamp",
+    "date": "timestamp",
+    "ticker": "ticker",
+    "symbol": "ticker",
+    "instrument": "ticker",
+    "direction": "direction",
+    "side": "direction",
+    "type": "direction",
+    "price": "price",
+    "quantity": "quantity",
+    "qty": "quantity",
+    "shares": "quantity",
+    "amount": "amount",
+    "fee": "fee",
+    "profit": "profit",
+}
+
+REQUIRED_COLUMNS = ["ticker", "direction", "price", "quantity"]
+
+# Internal column name -> column header used in the Excel file
+EXPORT_HEADERS = {
+    "trade_id": "Trade#",
+    "order_id": "Order#",
+    "timestamp": "Time",
+    "ticker": "Ticker",
+    "direction": "Direction",
+    "price": "Price",
+    "quantity": "Quantity",
+    "amount": "Amount",
+    "fee": "Fee",
+    "profit": "Profit",
+}
+
+TIMESTAMP_FORMAT = "%d.%m.%Y %H:%M:%S"
+
+
+def empty_trades() -> pd.DataFrame:
+    """Return an empty trades DataFrame with the standard columns."""
+    return pd.DataFrame(columns=TRADE_COLUMNS)
+
+
+def _parse_timestamps(series: pd.Series) -> pd.Series:
+    """Parse timestamps in the Freedom format, falling back to a day-first guess."""
+    parsed = pd.to_datetime(series, format=TIMESTAMP_FORMAT, errors="coerce")
+    missing = parsed.isna() & series.notna()
+    if missing.any():
+        parsed[missing] = pd.to_datetime(series[missing], dayfirst=True, errors="coerce")
+    return parsed
+
+
+def normalize_trades(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert a raw trades sheet (as read from Excel) into the internal format.
+
+    Column names are matched case-insensitively against COLUMN_ALIASES; the
+    first alias found for each internal column wins. Raises ValueError if any
+    of REQUIRED_COLUMNS is missing.
+    """
+    df = raw.copy()
+    df.columns = df.columns.astype(str).str.strip().str.lower()
+
+    rename_map = {}
+    for col in df.columns:
+        target = COLUMN_ALIASES.get(col)
+        if target and target not in rename_map.values():
+            rename_map[col] = target
+    df = df.rename(columns=rename_map)
+
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns {missing}. Found: {list(raw.columns)}")
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = _parse_timestamps(df["timestamp"])
+
+    for col in ("trade_id", "order_id"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    for col in ("price", "quantity", "amount"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    for col in ("fee", "profit"):
+        if col in df.columns:
+            df[col] = df[col].apply(parse_currency_value)
+
+    df["direction"] = df["direction"].astype(str).str.lower().str.strip()
+
+    if "amount" not in df.columns:
+        df["amount"] = df["price"] * df["quantity"]
+
+    if "timestamp" in df.columns:
+        df = df.sort_values("timestamp", ascending=False)
+
+    return df.reset_index(drop=True)
+
+
 def load_trades(file_path: Optional[str] = None) -> pd.DataFrame:
     """
     Load trades from Excel file.
@@ -47,73 +158,35 @@ def load_trades(file_path: Optional[str] = None) -> pd.DataFrame:
     if file_path is None:
         file_path = TRADES_FILE
 
-    path = Path(file_path)
-    if not path.exists():
-        # Return empty DataFrame with correct columns
-        return pd.DataFrame(columns=[
-            "trade_id", "order_id", "timestamp", "ticker", "direction",
-            "price", "quantity", "amount", "fee", "profit"
-        ])
+    if not Path(file_path).exists():
+        return empty_trades()
 
-    # Read Excel file
-    df = pd.read_excel(file_path)
+    return normalize_trades(pd.read_excel(file_path))
 
-    # Normalize column names
-    df.columns = df.columns.str.strip().str.lower()
 
-    # Expected columns mapping
-    column_rename = {
-        "trade#": "trade_id",
-        "order#": "order_id",
-        "time": "timestamp",
-        "ticker": "ticker",
-        "direction": "direction",
-        "price": "price",
-        "quantity": "quantity",
-        "amount": "amount",
-        "fee": "fee",
-        "profit": "profit",
-    }
+def _format_euro(value) -> str:
+    return f"€{value:.2f}" if pd.notna(value) and value else "€0"
 
-    # Rename columns
-    rename_map = {}
-    for old_name, new_name in column_rename.items():
-        if old_name in df.columns:
-            rename_map[old_name] = new_name
 
-    df = df.rename(columns=rename_map)
+def to_export_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert internal trades DataFrame into the Freedom Excel layout.
 
-    # Parse timestamp
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], format="%d.%m.%Y %H:%M:%S", errors="coerce")
+    Rows are sorted oldest-first *before* the timestamp is turned into text:
+    sorting the "dd.mm.YYYY" strings would order them by day-of-month.
+    """
+    export_df = df.copy()
 
-    # Parse numeric columns
-    if "trade_id" in df.columns:
-        df["trade_id"] = pd.to_numeric(df["trade_id"], errors="coerce").fillna(0).astype(int)
-    if "order_id" in df.columns:
-        df["order_id"] = pd.to_numeric(df["order_id"], errors="coerce").fillna(0).astype(int)
-    if "price" in df.columns:
-        df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
-    if "quantity" in df.columns:
-        df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
-    if "amount" in df.columns:
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+    if "timestamp" in export_df.columns:
+        export_df["timestamp"] = pd.to_datetime(export_df["timestamp"])
+        export_df = export_df.sort_values("timestamp", ascending=True)
+        export_df["timestamp"] = export_df["timestamp"].dt.strftime(TIMESTAMP_FORMAT)
 
-    # Parse currency columns
-    if "fee" in df.columns:
-        df["fee"] = df["fee"].apply(parse_currency_value)
-    if "profit" in df.columns:
-        df["profit"] = df["profit"].apply(parse_currency_value)
+    for col in ("fee", "profit"):
+        if col in export_df.columns:
+            export_df[col] = export_df[col].apply(_format_euro)
 
-    # Clean direction column
-    if "direction" in df.columns:
-        df["direction"] = df["direction"].str.lower().str.strip()
-
-    # Sort by timestamp descending (most recent first)
-    if "timestamp" in df.columns:
-        df = df.sort_values("timestamp", ascending=False)
-
-    return df.reset_index(drop=True)
+    return export_df.rename(columns=EXPORT_HEADERS)
 
 
 def save_trades(df: pd.DataFrame, file_path: Optional[str] = None) -> bool:
@@ -131,43 +204,8 @@ def save_trades(df: pd.DataFrame, file_path: Optional[str] = None) -> bool:
         file_path = TRADES_FILE
 
     try:
-        # Prepare DataFrame for export
-        export_df = df.copy()
-
-        # Rename columns back to original format
-        column_rename = {
-            "trade_id": "Trade#",
-            "order_id": "Order#",
-            "timestamp": "Time",
-            "ticker": "Ticker",
-            "direction": "Direction",
-            "price": "Price",
-            "quantity": "Quantity",
-            "amount": "Amount",
-            "fee": "Fee",
-            "profit": "Profit",
-        }
-
-        export_df = export_df.rename(columns=column_rename)
-
-        # Format timestamp
-        if "Time" in export_df.columns:
-            export_df["Time"] = export_df["Time"].dt.strftime("%d.%m.%Y %H:%M:%S")
-
-        # Format currency columns
-        if "Fee" in export_df.columns:
-            export_df["Fee"] = export_df["Fee"].apply(lambda x: f"€{x:.2f}" if x else "€0")
-        if "Profit" in export_df.columns:
-            export_df["Profit"] = export_df["Profit"].apply(lambda x: f"€{x:.2f}" if x else "€0")
-
-        # Sort by time ascending for export
-        if "Time" in export_df.columns:
-            export_df = export_df.sort_values("Time", ascending=True)
-
-        # Save to Excel
-        export_df.to_excel(file_path, index=False)
+        to_export_frame(df).to_excel(file_path, index=False)
         return True
-
     except Exception as e:
         print(f"Error saving trades: {e}")
         return False

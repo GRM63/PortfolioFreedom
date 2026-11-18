@@ -1,7 +1,10 @@
-streamlit>=1.28.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-yfinance>=0.2.30
-plotly>=5.18.0
-aiohttp>=3.9.0
-requests>=2.31.0
+# Versions this app was tested with. Streamlit >= 1.37 is required for
+# st.fragment(run_every=...); callable download_button data needs a recent release.
+streamlit==1.67.0
+pandas==3.0.5
+numpy==2.5.3
+openpyxl==3.1.5
+yfinance==1.8.0
+plotly==7.1.0
+requests==2.34.2
+python-dotenv==1.2.3

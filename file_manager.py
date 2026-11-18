@@ -10,6 +10,17 @@ from typing import Optional, Tuple, BinaryIO
 import shutil
 import io
 
+from config import PORTFOLIO_FILE
+from portfolio import PORTFOLIO_EXPORT_HEADERS
+from trades import (
+    TRADES_FILE,
+    empty_trades,
+    load_trades,
+    normalize_trades,
+    save_trades,
+    to_export_frame,
+)
+
 
 def backup_file(file_path: str) -> Optional[str]:
     """
@@ -34,7 +45,7 @@ def backup_file(file_path: str) -> Optional[str]:
 
 def import_portfolio_excel(
     uploaded_file: BinaryIO,
-    target_path: str = "Portfolio_22012026.xlsx"
+    target_path: str = PORTFOLIO_FILE
 ) -> Tuple[bool, str, Optional[pd.DataFrame]]:
     """
     Import a portfolio Excel file from upload.
@@ -78,11 +89,15 @@ def import_portfolio_excel(
 
 def import_trades_excel(
     uploaded_file: BinaryIO,
-    target_path: str = "Trades_Freedom.xlsx",
+    target_path: str = TRADES_FILE,
     merge: bool = True
 ) -> Tuple[bool, str, Optional[pd.DataFrame]]:
     """
     Import a trades Excel file from upload.
+
+    The upload is normalized (column aliases, dates, currency strings) and the
+    result is written with save_trades, so the file on disk is always in the
+    standard layout that load_trades expects.
 
     Args:
         uploaded_file: File-like object from Streamlit uploader
@@ -93,173 +108,55 @@ def import_trades_excel(
         Tuple of (success, message, DataFrame or None)
     """
     try:
-        from trades import load_trades, save_trades
+        new_df = normalize_trades(pd.read_excel(uploaded_file))
+    except ValueError as e:
+        return False, str(e), None
+    except Exception as e:
+        return False, f"Import error: {e}", None
 
-        # Read the uploaded file
-        new_df = pd.read_excel(uploaded_file)
-
-        # Normalize columns
-        new_df.columns = new_df.columns.str.strip().str.lower()
-
-        # Validate structure
-        required_cols = ["ticker", "direction", "price", "quantity"]
-        alt_cols = {
-            "ticker": ["ticker", "symbol", "instrument"],
-            "direction": ["direction", "side", "type"],
-            "price": ["price"],
-            "quantity": ["quantity", "qty", "shares"],
-        }
-
-        # Try to find columns
-        found_cols = {}
-        for req, alts in alt_cols.items():
-            for alt in alts:
-                if alt in new_df.columns:
-                    found_cols[alt] = req
-                    break
-
-        if len(found_cols) < len(required_cols):
-            return False, f"Missing required columns. Found: {list(new_df.columns)}", None
-
-        # Rename columns to standard names
-        new_df = new_df.rename(columns=found_cols)
-
+    try:
         if merge:
-            # Load existing trades
             existing_df = load_trades(target_path)
 
-            # Backup existing file
-            backup = backup_file(target_path)
-            backup_msg = f" (backup: {Path(backup).name})" if backup else ""
+            # Skip trades that already exist (matched on trade_id)
+            if "trade_id" in new_df.columns and not existing_df.empty:
+                known_ids = set(existing_df["trade_id"]) - {0}
+                new_df = new_df[~new_df["trade_id"].isin(known_ids)]
 
-            # Merge - avoid duplicates based on trade_id if available
-            if "trade#" in new_df.columns:
-                new_df = new_df.rename(columns={"trade#": "trade_id"})
-
-            if "trade_id" in new_df.columns and "trade_id" in existing_df.columns:
-                existing_ids = set(existing_df["trade_id"].tolist())
-                new_df = new_df[~new_df["trade_id"].isin(existing_ids)]
-
-            # Concatenate
-            merged_df = pd.concat([existing_df, new_df], ignore_index=True)
-
-            # Save
-            uploaded_file.seek(0)
-            content = uploaded_file.read()
-            with open(target_path, "wb") as f:
-                f.write(content)
-
-            added = len(new_df)
-            return True, f"Imported {added} new trades{backup_msg}", merged_df
+            frames = [f for f in (existing_df, new_df) if not f.empty]
+            result_df = pd.concat(frames, ignore_index=True) if frames else empty_trades()
+            message = f"Imported {len(new_df)} new trades"
         else:
-            # Replace entirely
-            backup = backup_file(target_path)
-            backup_msg = f" (backup: {Path(backup).name})" if backup else ""
+            result_df = new_df
+            message = "Trades file replaced"
 
-            uploaded_file.seek(0)
-            content = uploaded_file.read()
-            with open(target_path, "wb") as f:
-                f.write(content)
+        backup = backup_file(target_path)
+        if not save_trades(result_df, target_path):
+            return False, "Failed to write trades file", None
 
-            return True, f"Trades file replaced{backup_msg}", new_df
+        if backup:
+            message += f" (backup: {Path(backup).name})"
+        return True, message, result_df
 
     except Exception as e:
-        return False, f"Import error: {str(e)}", None
+        return False, f"Import error: {e}", None
 
 
 def export_portfolio_excel(df: pd.DataFrame) -> bytes:
-    """
-    Export portfolio DataFrame to Excel bytes for download.
-
-    Args:
-        df: Portfolio DataFrame
-
-    Returns:
-        Excel file as bytes
-    """
+    """Export portfolio DataFrame to Excel bytes for download."""
+    export_df = (
+        df.drop(columns=["yf_ticker", "platform_share"], errors="ignore")
+          .rename(columns=PORTFOLIO_EXPORT_HEADERS)
+    )
     output = io.BytesIO()
-
-    # Prepare export DataFrame
-    export_df = df.copy()
-
-    # Rename columns to user-friendly names
-    column_rename = {
-        "ticker": "Ticker",
-        "quantity": "Qty",
-        "entry_price": "Entry Price",
-        "platform_price": "Price",
-        "platform_value": "Value",
-        "platform_profit": "Profit",
-        "platform_growth": "Growth",
-        "entry_value": "Entry Value",
-    }
-
-    for old, new in column_rename.items():
-        if old in export_df.columns:
-            export_df = export_df.rename(columns={old: new})
-
-    # Remove internal columns
-    cols_to_remove = ["yf_ticker", "platform_share"]
-    for col in cols_to_remove:
-        if col in export_df.columns:
-            export_df = export_df.drop(columns=[col])
-
     export_df.to_excel(output, index=False)
-    output.seek(0)
-
     return output.getvalue()
 
 
 def export_trades_excel(df: pd.DataFrame) -> bytes:
-    """
-    Export trades DataFrame to Excel bytes for download.
-
-    Args:
-        df: Trades DataFrame
-
-    Returns:
-        Excel file as bytes
-    """
+    """Export trades DataFrame to Excel bytes for download."""
     output = io.BytesIO()
-
-    # Prepare export DataFrame
-    export_df = df.copy()
-
-    # Rename columns
-    column_rename = {
-        "trade_id": "Trade#",
-        "order_id": "Order#",
-        "timestamp": "Time",
-        "ticker": "Ticker",
-        "direction": "Direction",
-        "price": "Price",
-        "quantity": "Quantity",
-        "amount": "Amount",
-        "fee": "Fee",
-        "profit": "Profit",
-    }
-
-    for old, new in column_rename.items():
-        if old in export_df.columns:
-            export_df = export_df.rename(columns={old: new})
-
-    # Format timestamp
-    if "Time" in export_df.columns:
-        export_df["Time"] = pd.to_datetime(export_df["Time"]).dt.strftime("%d.%m.%Y %H:%M:%S")
-
-    # Format currency columns
-    if "Fee" in export_df.columns:
-        export_df["Fee"] = export_df["Fee"].apply(lambda x: f"€{x:.2f}" if pd.notna(x) else "€0")
-    if "Profit" in export_df.columns:
-        export_df["Profit"] = export_df["Profit"].apply(lambda x: f"€{x:.2f}" if pd.notna(x) else "€0")
-
-    # Sort by time
-    if "Time" in export_df.columns:
-        export_df = export_df.sort_values("Time", ascending=True)
-
-    export_df.to_excel(output, index=False)
-    output.seek(0)
-
+    to_export_frame(df).to_excel(output, index=False)
     return output.getvalue()
 
 

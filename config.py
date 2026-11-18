@@ -5,15 +5,11 @@ Configuration and ticker mappings for the Portfolio Monitor.
 import os
 from pathlib import Path
 
-# Load .env file if it exists
-env_file = Path(__file__).parent / ".env"
-if env_file.exists():
-    with open(env_file) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip().strip('"\''))
+from dotenv import load_dotenv
+
+# Load .env next to this file. Existing environment variables win
+# (override=False), matching the previous hand-written parser.
+load_dotenv(Path(__file__).parent / ".env", override=False)
 
 # Freedom24/Tradernet API credentials (from environment variables)
 TRADERNET_LOGIN = os.environ.get("TRADERNET_LOGIN", "")
@@ -32,18 +28,6 @@ TICKER_MAPPING = {
     "AMD.US": "AMD",          # AMD (NYSE)
     "HOOD.US": "HOOD",        # Robinhood (NASDAQ)
     "AETF.GR": "AETF.AT",    # Greek ETF (Athens)
-}
-
-# Currency for each yfinance ticker (for display/conversion)
-TICKER_CURRENCIES = {
-    "VWCE.DE": "EUR",
-    "EQQB.DE": "EUR",
-    "DGRE.DE": "EUR",
-    "VAGF.DE": "EUR",
-    "NVD.DE": "EUR",
-    "AMD": "USD",
-    "HOOD": "USD",
-    "AETF.AT": "EUR",
 }
 
 # Default refresh interval in seconds
@@ -68,8 +52,7 @@ CHART_PERIODS = {
     "Year to Date": "ytd",
 }
 
-# Cache TTL in seconds
-PRICE_CACHE_TTL = 30
+# Cache TTL for price history, in seconds
 HISTORY_CACHE_TTL = 300
 
 # Excel file path
