@@ -8,7 +8,9 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 import time
 
 from config import (
@@ -23,7 +25,7 @@ from config import (
 )
 from portfolio import load_portfolio
 from market_data import get_price_history
-from trades import load_trades, save_trades, add_trade, delete_trade, get_trades_summary, TRADES_FILE
+from trades import load_trades, save_trades, add_trade, get_trades_summary, TRADES_FILE
 from file_manager import (
     import_portfolio_excel,
     import_trades_excel,
@@ -59,8 +61,6 @@ if "auto_refresh" not in st.session_state:
     st.session_state.auto_refresh = True
 if "data_source" not in st.session_state:
     st.session_state.data_source = DATA_SOURCE
-if "trades_df" not in st.session_state:
-    st.session_state.trades_df = None
 
 init_alerts()
 
@@ -86,6 +86,37 @@ def format_change(value: float, is_percent: bool = False) -> str:
     if is_percent:
         return f"{sign}{value:.2f}%"
     return f"{sign}{value:,.2f}"
+
+
+def file_mtime(path: str) -> Optional[float]:
+    """Last-modified time of a file, or None if it doesn't exist."""
+    try:
+        return Path(path).stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
+# The Excel readers are cached on (path, mtime): the mtime argument isn't used
+# inside the function, but it is part of the cache key, so the cache is
+# invalidated automatically whenever the file changes on disk.
+@st.cache_data(show_spinner=False)
+def _load_trades_cached(path: str, mtime: Optional[float]) -> pd.DataFrame:
+    return load_trades(path)
+
+
+@st.cache_data(show_spinner=False)
+def _load_portfolio_cached(path: str, mtime: Optional[float]) -> pd.DataFrame:
+    return load_portfolio(path)
+
+
+def get_trades() -> pd.DataFrame:
+    """Trades from TRADES_FILE, re-read only when the file changes."""
+    return _load_trades_cached(TRADES_FILE, file_mtime(TRADES_FILE))
+
+
+def get_excel_portfolio() -> pd.DataFrame:
+    """Portfolio from PORTFOLIO_FILE, re-read only when the file changes."""
+    return _load_portfolio_cached(PORTFOLIO_FILE, file_mtime(PORTFOLIO_FILE))
 
 
 @st.cache_data(ttl=30)
@@ -131,7 +162,7 @@ def load_portfolio_data() -> tuple[pd.DataFrame, str]:
         except Exception as e:
             st.warning(f"API error: {e}. Falling back to Excel.")
 
-    df = load_portfolio()
+    df = get_excel_portfolio()
     return df, f"Data from {PORTFOLIO_FILE}"
 
 
@@ -200,7 +231,6 @@ def render_sidebar(portfolio: pd.DataFrame, data_source: str):
 
         if selected_source != st.session_state.data_source:
             st.session_state.data_source = selected_source
-            st.cache_data.clear()
             st.rerun()
     else:
         st.sidebar.caption("API: Not configured")
@@ -230,7 +260,7 @@ def render_sidebar(portfolio: pd.DataFrame, data_source: str):
         st.sidebar.caption(f"Last refresh: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
 
     if st.sidebar.button("Refresh Now"):
-        st.cache_data.clear()
+        fetch_portfolio_from_api.clear()
         st.session_state.last_refresh = datetime.now()
         st.rerun()
 
@@ -374,7 +404,6 @@ def render_import_export_section(portfolio: pd.DataFrame):
                 success, message, _ = import_portfolio_excel(uploaded_portfolio, PORTFOLIO_FILE)
                 if success:
                     st.success(message)
-                    st.cache_data.clear()
                     time.sleep(1)
                     st.rerun()
                 else:
@@ -393,7 +422,6 @@ def render_import_export_section(portfolio: pd.DataFrame):
                 success, message, _ = import_trades_excel(uploaded_trades, TRADES_FILE, merge=merge_trades)
                 if success:
                     st.success(message)
-                    st.session_state.trades_df = None  # Force reload
                     time.sleep(1)
                     st.rerun()
                 else:
@@ -404,21 +432,23 @@ def render_import_export_section(portfolio: pd.DataFrame):
 
         # Export portfolio
         if not portfolio.empty:
-            portfolio_bytes = export_portfolio_excel(portfolio)
+            # A callable is only run when the button is clicked, so the
+            # Excel file is no longer rebuilt on every rerun.
             st.download_button(
                 label="Download Portfolio Excel",
-                data=portfolio_bytes,
+                data=lambda: export_portfolio_excel(portfolio),
+                on_click="ignore",
                 file_name=f"portfolio_export_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
         # Export trades
-        trades_df = load_trades()
+        trades_df = get_trades()
         if not trades_df.empty:
-            trades_bytes = export_trades_excel(trades_df)
             st.download_button(
                 label="Download Trades Excel",
-                data=trades_bytes,
+                data=lambda: export_trades_excel(trades_df),
+                on_click="ignore",
                 file_name=f"trades_export_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
@@ -441,8 +471,7 @@ def render_trades_tab():
     """Render the Trades tab content."""
     st.header("Trade History")
 
-    # Load trades
-    trades_df = load_trades()
+    trades_df = get_trades()
 
     if trades_df.empty:
         st.info("No trades found. Import trades from Excel or add manually.")
@@ -650,7 +679,7 @@ def main():
         time_since_refresh = (datetime.now() - st.session_state.last_refresh).total_seconds()
         if time_since_refresh >= st.session_state.refresh_interval:
             st.session_state.last_refresh = datetime.now()
-            st.cache_data.clear()
+            fetch_portfolio_from_api.clear()
             time.sleep(0.5)
             st.rerun()
 
