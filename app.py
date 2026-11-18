@@ -33,12 +33,14 @@ from file_manager import (
     get_file_info,
 )
 from alerts import (
-    init_alerts,
-    add_alert,
-    remove_alert,
-    get_alerts,
     AlertType,
+    add_alert,
+    check_alerts,
     format_alert_type,
+    load_state as load_alert_state,
+    rearm_alert,
+    remove_alert,
+    save_state as save_alert_state,
 )
 
 # Page config
@@ -73,25 +75,23 @@ if "auto_refresh" not in st.session_state:
 if "data_source" not in st.session_state:
     st.session_state.data_source = DATA_SOURCE
 
-init_alerts()
-
 API_AVAILABLE = bool(TRADERNET_LOGIN and TRADERNET_PASSWORD)
 API_RETRY_SECONDS = 60  # after an API failure, use Excel for this long before retrying
 
 
-def flash(message: str):
+def flash(message: str, icon: str = "✅"):
     """Queue a toast to show after the next st.rerun().
 
     Replaces the old `st.success(...); time.sleep(1); st.rerun()` pattern,
     which blocked the server for a second just so the message was readable.
+    Messages are queued in a list, so several alerts can fire at once.
     """
-    st.session_state.flash = message
+    st.session_state.setdefault("flash", []).append((message, icon))
 
 
 def show_flash():
-    message = st.session_state.pop("flash", None)
-    if message:
-        st.toast(message, icon="✅")
+    for message, icon in st.session_state.pop("flash", []):
+        st.toast(message, icon=icon)
 
 
 def format_currency(value: float, currency: str = "EUR") -> str:
@@ -311,43 +311,120 @@ def render_sidebar(portfolio: pd.DataFrame):
         st.session_state.last_refresh = datetime.now()
         st.rerun()
 
-    # Alerts section
+    render_alerts_sidebar(portfolio)
+
+
+def render_alerts_sidebar(portfolio: pd.DataFrame):
+    """Add, list, re-arm and delete price alerts (stored in alerts.json)."""
     st.sidebar.divider()
     st.sidebar.subheader("Price Alerts")
+    state = load_alert_state()
 
     with st.sidebar.expander("Add New Alert", expanded=False):
         ticker_options = portfolio["ticker"].tolist() if not portfolio.empty else []
 
         if ticker_options:
-            alert_ticker = st.selectbox("Ticker", ticker_options)
+            alert_ticker = st.selectbox("Ticker", ticker_options, key="alert_ticker")
             alert_type = st.selectbox(
                 "Alert Type",
                 options=list(AlertType),
-                format_func=format_alert_type
+                format_func=format_alert_type,
+                key="alert_type",
             )
+            is_pct = alert_type.needs_daily_change
             alert_threshold = st.number_input(
-                "Threshold",
+                "Threshold (%)" if is_pct else "Threshold (price, as in Holdings)",
                 min_value=0.0,
-                step=0.01,
-                format="%.2f"
+                step=0.5 if is_pct else 0.01,
+                format="%.2f",
+                key="alert_threshold",
             )
 
             if st.button("Add Alert"):
-                add_alert(alert_ticker, alert_type, alert_threshold)
+                add_alert(state, alert_ticker, alert_type, alert_threshold)
+                save_alert_state(state)
                 flash(f"Alert added for {alert_ticker}")
                 st.rerun()
+        else:
+            st.caption("Load a portfolio to add alerts.")
 
-    alerts = get_alerts()
-    if alerts:
-        st.sidebar.caption(f"{len(alerts)} active alert(s)")
-        for alert_id, alert in alerts.items():
-            col1, col2 = st.sidebar.columns([3, 1])
+    if not state.alerts:
+        st.sidebar.caption("No alerts set.")
+    else:
+        armed = sum(not a.triggered for a in state.alerts.values())
+        st.sidebar.caption(f"{armed} armed · {len(state.alerts) - armed} triggered")
+
+        for alert in state.alerts.values():
+            unit = "%" if alert.alert_type.needs_daily_change else ""
+            col1, col2 = st.sidebar.columns([4, 1])
             with col1:
-                st.caption(f"{'🔔' if alert.triggered else '⏳'} {alert.ticker}: {format_alert_type(alert.alert_type)} {alert.threshold:.2f}")
+                status = "🔔" if alert.triggered else "⏳"
+                st.caption(f"{status} **{alert.ticker}**: {format_alert_type(alert.alert_type)} "
+                           f"{alert.threshold:,.2f}{unit}")
             with col2:
-                if st.button("✕", key=f"del_{alert_id}"):
-                    remove_alert(alert_id)
+                if alert.triggered and st.button("↻", key=f"rearm_{alert.id}", help="Re-arm"):
+                    rearm_alert(state, alert.id)
+                    save_alert_state(state)
                     st.rerun()
+                if st.button("✕", key=f"del_{alert.id}", help="Delete"):
+                    remove_alert(state, alert.id)
+                    save_alert_state(state)
+                    st.rerun()
+
+    if state.history:
+        with st.sidebar.expander(f"Alert history ({len(state.history)})"):
+            for note in reversed(state.history[-10:]):
+                st.caption(f"{note['time'].replace('T', ' ')} · {note['message']}")
+            if st.button("Clear history"):
+                state.history.clear()
+                save_alert_state(state)
+                st.rerun()
+
+
+def daily_change_pct(yf_ticker: str) -> Optional[float]:
+    """Today's % change from the last two daily closes (cached with the charts)."""
+    hist = get_price_history(yf_ticker, "5d")
+    if hist is None or len(hist) < 2:
+        return None
+    last, prev = hist["Close"].iloc[-1], hist["Close"].iloc[-2]
+    return float((last / prev - 1) * 100) if prev else None
+
+
+def run_alert_checks(portfolio: pd.DataFrame):
+    """
+    Check armed alerts against the latest portfolio prices.
+
+    Runs inside the live-portfolio fragment, so with auto-refresh on, alerts
+    are checked on every refresh. Price alerts use the platform price shown
+    in Holdings; daily-change alerts use yfinance closes, fetched only for
+    tickers that have such an alert.
+    """
+    state = load_alert_state()
+    armed = [a for a in state.alerts.values() if not a.triggered]
+    if not armed or portfolio.empty:
+        return
+
+    rows = portfolio.set_index("ticker")
+    quotes = {}
+    for ticker in {a.ticker for a in armed}:
+        if ticker not in rows.index:
+            continue
+        row = rows.loc[ticker]
+        price = float(row["platform_price"]) if row["platform_price"] > 0 else None
+        needs_change = any(a.ticker == ticker and a.alert_type.needs_daily_change for a in armed)
+        quotes[ticker] = {
+            "price": price,
+            "change_pct": daily_change_pct(row["yf_ticker"]) if needs_change else None,
+        }
+
+    fired = check_alerts(state, quotes)
+    if fired:
+        save_alert_state(state)
+        for note in fired:
+            flash(note["message"], icon="🔔")
+        # Fragments can't redraw the sidebar, so rerun the whole app once to
+        # show the new 🔔 status there. Fired alerts won't fire again.
+        st.rerun(scope="app")
 
 
 def render_portfolio_summary(portfolio: pd.DataFrame):
@@ -711,6 +788,8 @@ def render_live_portfolio():
 
     if portfolio.empty:
         return
+
+    run_alert_checks(portfolio)
 
     render_portfolio_summary(portfolio)
 
