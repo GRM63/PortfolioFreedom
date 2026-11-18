@@ -52,8 +52,9 @@ CHART_PERIODS = {
     "Year to Date": "ytd",
 }
 
-# Cache TTL for price history, in seconds
-HISTORY_CACHE_TTL = 300
+# Cache TTLs, in seconds
+HISTORY_CACHE_TTL = 300   # price history for charts
+QUOTE_CACHE_TTL = 60      # live quote used for daily-change alerts
 
 # Excel file path
 PORTFOLIO_FILE = "Portfolio_22012026.xlsx"
