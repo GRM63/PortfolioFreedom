@@ -49,6 +49,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Oldest Streamlit with every API this app uses: st.dataframe(width="stretch")
+# needs 1.48, st.plotly_chart(width="stretch") 1.51, and download_button with
+# a callable `data` 1.52. Fail early with a clear message instead of a
+# TypeError deep inside a fragment.
+MIN_STREAMLIT = (1, 52)
+_installed = tuple(int(part) for part in st.__version__.split(".")[:2])
+if _installed < MIN_STREAMLIT:
+    st.error(
+        f"This app needs Streamlit {'.'.join(map(str, MIN_STREAMLIT))} or newer, "
+        f"but {st.__version__} is installed. Run:\n\n"
+        "`pip install -r requirements.txt`"
+    )
+    st.stop()
+
 # Initialize session state
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = datetime.now()
