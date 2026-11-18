@@ -1,6 +1,6 @@
 """
 Portfolio Monitor - Streamlit App
-Live portfolio tracking via Freedom24/Tradernet API with yfinance charts.
+Portfolio tracking from a Freedom24 Excel export, with yfinance charts and price alerts.
 Includes trade history management and Excel import/export.
 """
 
@@ -16,13 +16,10 @@ from typing import Optional
 from config import (
     PORTFOLIO_FILE,
     CHART_PERIODS,
-    TRADERNET_LOGIN,
-    TRADERNET_PASSWORD,
-    DATA_SOURCE,
     DEFAULT_REFRESH_INTERVAL,
     REFRESH_INTERVALS,
 )
-from portfolio import load_portfolio, get_yfinance_ticker
+from portfolio import load_portfolio
 from market_data import get_daily_change_pct, get_price_history
 from trades import load_trades, save_trades, add_trade, get_trades_summary, TRADES_FILE
 from file_manager import (
@@ -72,11 +69,6 @@ if "refresh_interval" not in st.session_state:
     st.session_state.refresh_interval = DEFAULT_REFRESH_INTERVAL
 if "auto_refresh" not in st.session_state:
     st.session_state.auto_refresh = True
-if "data_source" not in st.session_state:
-    st.session_state.data_source = DATA_SOURCE
-
-API_AVAILABLE = bool(TRADERNET_LOGIN and TRADERNET_PASSWORD)
-API_RETRY_SECONDS = 60  # after an API failure, use Excel for this long before retrying
 
 
 def flash(message: str, icon: str = "✅"):
@@ -143,77 +135,9 @@ def get_excel_portfolio() -> pd.DataFrame:
     return _load_portfolio_cached(PORTFOLIO_FILE, file_mtime(PORTFOLIO_FILE))
 
 
-@st.cache_resource
-def get_api_client():
-    """
-    One Tradernet client per server process.
-
-    cache_resource (unlike cache_data) returns the *same* object every time
-    instead of a copy, which is what we want for a connection/session.
-    """
-    from tradernet import TradernetClient
-    return TradernetClient(TRADERNET_LOGIN, TRADERNET_PASSWORD)
-
-
-@st.cache_data(ttl=30)
-def fetch_portfolio_from_api() -> pd.DataFrame:
-    """Fetch portfolio data from Tradernet API."""
-    if not API_AVAILABLE:
-        raise ValueError("API credentials not configured")
-
-    portfolio_data = get_api_client().get_portfolio_sync()
-
-    if portfolio_data is None:
-        raise ValueError("Failed to fetch portfolio from API")
-
-    rows = []
-    for pos in portfolio_data.positions:
-        entry_value = pos.avg_price * pos.quantity
-        rows.append({
-            "ticker": pos.ticker,
-            "yf_ticker": get_yfinance_ticker(pos.ticker),
-            "quantity": pos.quantity,
-            "entry_price": pos.avg_price,
-            "entry_value": entry_value,
-            "platform_price": pos.current_price,
-            "platform_value": pos.current_value,
-            "platform_profit": pos.profit,
-            "platform_growth": pos.profit_pct,
-        })
-
-    return pd.DataFrame(rows)
-
-
-def load_portfolio_data() -> tuple[pd.DataFrame, str, Optional[str]]:
-    """
-    Load portfolio data from the configured source.
-
-    Returns (portfolio, source label, warning or None). Doesn't draw anything,
-    so it can be called from both the main script and the live fragment.
-    """
-    warning = None
-
-    if st.session_state.data_source == "api" and API_AVAILABLE:
-        failed_at = st.session_state.get("api_failed_at")
-        seconds_since_failure = (datetime.now() - failed_at).total_seconds() if failed_at else None
-
-        if seconds_since_failure is None or seconds_since_failure >= API_RETRY_SECONDS:
-            try:
-                df = fetch_portfolio_from_api()
-                st.session_state.api_failed_at = None
-                return df, "Live data from Freedom24 API", None
-            except Exception as e:
-                # Remember the failure so the next reruns don't each wait
-                # on a dead API before falling back.
-                st.session_state.api_failed_at = datetime.now()
-                st.session_state.api_error = str(e)
-                seconds_since_failure = 0
-
-        retry_in = int(API_RETRY_SECONDS - seconds_since_failure)
-        warning = (f"API error: {st.session_state.get('api_error')}. "
-                   f"Showing Excel data; retrying in {retry_in}s.")
-
-    return get_excel_portfolio(), f"Data from {PORTFOLIO_FILE}", warning
+def load_portfolio_data() -> tuple[pd.DataFrame, str]:
+    """Load the portfolio from the Excel file. Returns (portfolio, source label)."""
+    return get_excel_portfolio(), f"Data from {PORTFOLIO_FILE}"
 
 
 def create_price_chart(ticker: str, period: str = "1mo") -> go.Figure:
@@ -263,51 +187,28 @@ def render_sidebar(portfolio: pd.DataFrame):
     """Render the sidebar with settings."""
     st.sidebar.title("Settings")
 
-    # Data source selection
-    st.sidebar.subheader("Data Source")
-    if API_AVAILABLE:
-        source_options = ["api", "excel"]
-        source_labels = ["Live API", "Excel File"]
-        current_idx = source_options.index(st.session_state.data_source) if st.session_state.data_source in source_options else 0
+    st.sidebar.subheader("Auto-Refresh")
+    st.session_state.auto_refresh = st.sidebar.checkbox(
+        "Enable auto-refresh",
+        value=st.session_state.auto_refresh,
+        help="Re-checks price alerts with fresh quotes and reloads the "
+             "portfolio file if it changed on disk.",
+    )
 
-        selected_source = st.sidebar.radio(
-            "Source",
-            options=source_options,
-            format_func=lambda x: source_labels[source_options.index(x)],
-            index=current_idx,
-        )
-
-        if selected_source != st.session_state.data_source:
-            st.session_state.data_source = selected_source
-            st.rerun()
-    else:
-        st.sidebar.caption("API: Not configured")
-        st.sidebar.caption("Add credentials to .env file")
-
-    # Auto-refresh settings
-    if st.session_state.data_source == "api" and API_AVAILABLE:
-        st.sidebar.divider()
-        st.sidebar.subheader("Auto-Refresh")
-
-        st.session_state.auto_refresh = st.sidebar.checkbox(
-            "Enable auto-refresh",
-            value=st.session_state.auto_refresh
-        )
-
-        refresh_options = dict(REFRESH_INTERVALS)
-        labels = list(refresh_options)
-        current = next((l for l, sec in refresh_options.items()
-                        if sec == st.session_state.refresh_interval), labels[1])
-        selected_interval = st.sidebar.selectbox(
-            "Refresh interval",
-            options=labels,
-            index=labels.index(current),
-            disabled=not st.session_state.auto_refresh
-        )
-        st.session_state.refresh_interval = refresh_options[selected_interval]
+    refresh_options = dict(REFRESH_INTERVALS)
+    labels = list(refresh_options)
+    current = next((l for l, sec in refresh_options.items()
+                    if sec == st.session_state.refresh_interval), labels[1])
+    selected_interval = st.sidebar.selectbox(
+        "Refresh interval",
+        options=labels,
+        index=labels.index(current),
+        disabled=not st.session_state.auto_refresh
+    )
+    st.session_state.refresh_interval = refresh_options[selected_interval]
 
     if st.sidebar.button("Refresh Now"):
-        fetch_portfolio_from_api.clear()
+        get_daily_change_pct.clear()  # fetch fresh quotes for alerts
         st.session_state.last_refresh = datetime.now()
         st.rerun()
 
@@ -753,29 +654,17 @@ def render_live_portfolio():
     Summary metrics, holdings table and allocation chart.
 
     Called as a fragment with run_every when auto-refresh is on: Streamlit
-    re-executes only this function on a timer, so the live numbers update
-    without rerunning (and redrawing) the rest of the page.
+    re-executes only this function on a timer, so alerts are re-checked (and
+    a changed portfolio file is picked up) without rerunning the whole page.
     """
-    live = st.session_state.data_source == "api" and API_AVAILABLE
-
-    if live and st.session_state.auto_refresh:
-        elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
-        # Small tolerance: a timer tick can land a few ms before the interval
-        if elapsed >= st.session_state.refresh_interval - 1:
-            fetch_portfolio_from_api.clear()
-            st.session_state.last_refresh = datetime.now()
+    st.session_state.last_refresh = datetime.now()
 
     try:
-        portfolio, data_source, warning = load_portfolio_data()
+        portfolio, data_source = load_portfolio_data()
     except Exception:
         return  # main() already reported the error
 
-    if warning:
-        st.warning(warning)
-    elif live:
-        st.success(f"📡 {data_source}")
-    else:
-        st.info(f"📄 {data_source}")
+    st.info(f"📄 {data_source}")
 
     if portfolio.empty:
         return
@@ -792,15 +681,12 @@ def render_live_portfolio():
     with col2:
         render_allocation_chart(portfolio)
 
-    if live:
-        st.caption(f"Last refresh: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
+    st.caption(f"Last refresh: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
 
 
 def render_portfolio_tab(portfolio: pd.DataFrame):
     """Render the Portfolio tab content."""
-    auto = (st.session_state.data_source == "api" and API_AVAILABLE
-            and st.session_state.auto_refresh)
-    run_every = st.session_state.refresh_interval if auto else None
+    run_every = st.session_state.refresh_interval if st.session_state.auto_refresh else None
 
     # st.fragment can wrap a function at call time, which lets the interval
     # come from the sidebar setting.
@@ -818,7 +704,7 @@ def main():
 
     # Load portfolio data (cached) for the sidebar and import/export tab
     try:
-        portfolio, _, _ = load_portfolio_data()
+        portfolio, _ = load_portfolio_data()
     except FileNotFoundError:
         portfolio = pd.DataFrame()
         st.warning(f"Portfolio file not found: {PORTFOLIO_FILE}")

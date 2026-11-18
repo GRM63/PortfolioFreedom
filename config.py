@@ -2,22 +2,6 @@
 Configuration and ticker mappings for the Portfolio Monitor.
 """
 
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-
-# Load .env next to this file. Existing environment variables win
-# (override=False), matching the previous hand-written parser.
-load_dotenv(Path(__file__).parent / ".env", override=False)
-
-# Freedom24/Tradernet API credentials (from environment variables)
-TRADERNET_LOGIN = os.environ.get("TRADERNET_LOGIN", "")
-TRADERNET_PASSWORD = os.environ.get("TRADERNET_PASSWORD", "")
-
-# Data source: "api" for live Tradernet API, "excel" for Excel file
-DATA_SOURCE = os.environ.get("DATA_SOURCE", "api" if TRADERNET_LOGIN else "excel")
-
 # Map Freedom platform tickers to yfinance symbols
 TICKER_MAPPING = {
     "VWCE.EU": "VWCE.DE",    # Vanguard FTSE All-World UCITS ETF (Xetra)
