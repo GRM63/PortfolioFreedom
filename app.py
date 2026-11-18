@@ -23,7 +23,7 @@ from config import (
     REFRESH_INTERVALS,
 )
 from portfolio import load_portfolio, get_yfinance_ticker
-from market_data import get_price_history
+from market_data import get_daily_change_pct, get_price_history
 from trades import load_trades, save_trades, add_trade, get_trades_summary, TRADES_FILE
 from file_manager import (
     import_portfolio_excel,
@@ -381,22 +381,13 @@ def render_alerts_sidebar(portfolio: pd.DataFrame):
                 st.rerun()
 
 
-def daily_change_pct(yf_ticker: str) -> Optional[float]:
-    """Today's % change from the last two daily closes (cached with the charts)."""
-    hist = get_price_history(yf_ticker, "5d")
-    if hist is None or len(hist) < 2:
-        return None
-    last, prev = hist["Close"].iloc[-1], hist["Close"].iloc[-2]
-    return float((last / prev - 1) * 100) if prev else None
-
-
 def run_alert_checks(portfolio: pd.DataFrame):
     """
     Check armed alerts against the latest portfolio prices.
 
     Runs inside the live-portfolio fragment, so with auto-refresh on, alerts
     are checked on every refresh. Price alerts use the platform price shown
-    in Holdings; daily-change alerts use yfinance closes, fetched only for
+    in Holdings; daily-change alerts use Yahoo's previous close, fetched only for
     tickers that have such an alert.
     """
     state = load_alert_state()
@@ -414,7 +405,7 @@ def run_alert_checks(portfolio: pd.DataFrame):
         needs_change = any(a.ticker == ticker and a.alert_type.needs_daily_change for a in armed)
         quotes[ticker] = {
             "price": price,
-            "change_pct": daily_change_pct(row["yf_ticker"]) if needs_change else None,
+            "change_pct": get_daily_change_pct(row["yf_ticker"]) if needs_change else None,
         }
 
     fired = check_alerts(state, quotes)
