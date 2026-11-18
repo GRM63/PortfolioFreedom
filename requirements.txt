@@ -1,5 +1,5 @@
-# Versions this app was tested with. Streamlit >= 1.37 is required for
-# st.fragment(run_every=...); callable download_button data needs a recent release.
+# Versions this app was tested with. Streamlit >= 1.52 is required
+# (callable download_button data; app.py checks this at startup).
 streamlit==1.67.0
 pandas==3.0.5
 numpy==2.5.3
