@@ -6,12 +6,12 @@ Includes trade history management and Excel import/export.
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-import time
 
 from config import (
     PORTFOLIO_FILE,
@@ -63,6 +63,24 @@ if "data_source" not in st.session_state:
     st.session_state.data_source = DATA_SOURCE
 
 init_alerts()
+
+API_AVAILABLE = bool(TRADERNET_LOGIN and TRADERNET_PASSWORD)
+API_RETRY_SECONDS = 60  # after an API failure, use Excel for this long before retrying
+
+
+def flash(message: str):
+    """Queue a toast to show after the next st.rerun().
+
+    Replaces the old `st.success(...); time.sleep(1); st.rerun()` pattern,
+    which blocked the server for a second just so the message was readable.
+    """
+    st.session_state.flash = message
+
+
+def show_flash():
+    message = st.session_state.pop("flash", None)
+    if message:
+        st.toast(message, icon="✅")
 
 
 def get_yfinance_ticker(ticker: str) -> str:
@@ -119,16 +137,25 @@ def get_excel_portfolio() -> pd.DataFrame:
     return _load_portfolio_cached(PORTFOLIO_FILE, file_mtime(PORTFOLIO_FILE))
 
 
+@st.cache_resource
+def get_api_client():
+    """
+    One Tradernet client per server process.
+
+    cache_resource (unlike cache_data) returns the *same* object every time
+    instead of a copy, which is what we want for a connection/session.
+    """
+    from tradernet import TrdernetClient
+    return TrdernetClient(TRADERNET_LOGIN, TRADERNET_PASSWORD)
+
+
 @st.cache_data(ttl=30)
 def fetch_portfolio_from_api() -> pd.DataFrame:
     """Fetch portfolio data from Tradernet API."""
-    from tradernet import TrdernetClient
-
-    if not TRADERNET_LOGIN or not TRADERNET_PASSWORD:
+    if not API_AVAILABLE:
         raise ValueError("API credentials not configured")
 
-    client = TrdernetClient(TRADERNET_LOGIN, TRADERNET_PASSWORD)
-    portfolio_data = client.get_portfolio_sync()
+    portfolio_data = get_api_client().get_portfolio_sync()
 
     if portfolio_data is None:
         raise ValueError("Failed to fetch portfolio from API")
@@ -151,19 +178,36 @@ def fetch_portfolio_from_api() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_portfolio_data() -> tuple[pd.DataFrame, str]:
-    """Load portfolio data from configured source."""
-    source = st.session_state.data_source
+def load_portfolio_data() -> tuple[pd.DataFrame, str, Optional[str]]:
+    """
+    Load portfolio data from the configured source.
 
-    if source == "api" and TRADERNET_LOGIN and TRADERNET_PASSWORD:
-        try:
-            df = fetch_portfolio_from_api()
-            return df, "Live data from Freedom24 API"
-        except Exception as e:
-            st.warning(f"API error: {e}. Falling back to Excel.")
+    Returns (portfolio, source label, warning or None). Doesn't draw anything,
+    so it can be called from both the main script and the live fragment.
+    """
+    warning = None
 
-    df = get_excel_portfolio()
-    return df, f"Data from {PORTFOLIO_FILE}"
+    if st.session_state.data_source == "api" and API_AVAILABLE:
+        failed_at = st.session_state.get("api_failed_at")
+        seconds_since_failure = (datetime.now() - failed_at).total_seconds() if failed_at else None
+
+        if seconds_since_failure is None or seconds_since_failure >= API_RETRY_SECONDS:
+            try:
+                df = fetch_portfolio_from_api()
+                st.session_state.api_failed_at = None
+                return df, "Live data from Freedom24 API", None
+            except Exception as e:
+                # Remember the failure so the next reruns don't each wait
+                # on a dead API before falling back.
+                st.session_state.api_failed_at = datetime.now()
+                st.session_state.api_error = str(e)
+                seconds_since_failure = 0
+
+        retry_in = int(API_RETRY_SECONDS - seconds_since_failure)
+        warning = (f"API error: {st.session_state.get('api_error')}. "
+                   f"Showing Excel data; retrying in {retry_in}s.")
+
+    return get_excel_portfolio(), f"Data from {PORTFOLIO_FILE}", warning
 
 
 def create_price_chart(ticker: str, period: str = "1mo") -> go.Figure:
@@ -184,8 +228,8 @@ def create_price_chart(ticker: str, period: str = "1mo") -> go.Figure:
         name=ticker,
     ))
 
-    colors = ["red" if hist["Close"].iloc[i] < hist["Open"].iloc[i] else "green"
-              for i in range(len(hist))]
+    # Vectorised: compares whole columns at once instead of looping per row
+    colors = np.where(hist["Close"] < hist["Open"], "red", "green")
 
     fig.add_trace(go.Bar(
         x=hist.index,
@@ -209,15 +253,13 @@ def create_price_chart(ticker: str, period: str = "1mo") -> go.Figure:
     return fig
 
 
-def render_sidebar(portfolio: pd.DataFrame, data_source: str):
+def render_sidebar(portfolio: pd.DataFrame):
     """Render the sidebar with settings."""
     st.sidebar.title("Settings")
 
     # Data source selection
     st.sidebar.subheader("Data Source")
-    api_available = bool(TRADERNET_LOGIN and TRADERNET_PASSWORD)
-
-    if api_available:
+    if API_AVAILABLE:
         source_options = ["api", "excel"]
         source_labels = ["Live API", "Excel File"]
         current_idx = source_options.index(st.session_state.data_source) if st.session_state.data_source in source_options else 0
@@ -236,10 +278,8 @@ def render_sidebar(portfolio: pd.DataFrame, data_source: str):
         st.sidebar.caption("API: Not configured")
         st.sidebar.caption("Add credentials to .env file")
 
-    st.sidebar.caption(f"Current: {data_source}")
-
     # Auto-refresh settings
-    if st.session_state.data_source == "api" and api_available:
+    if st.session_state.data_source == "api" and API_AVAILABLE:
         st.sidebar.divider()
         st.sidebar.subheader("Auto-Refresh")
 
@@ -248,16 +288,17 @@ def render_sidebar(portfolio: pd.DataFrame, data_source: str):
             value=st.session_state.auto_refresh
         )
 
-        refresh_options = {label: seconds for label, seconds in REFRESH_INTERVALS}
+        refresh_options = dict(REFRESH_INTERVALS)
+        labels = list(refresh_options)
+        current = next((l for l, sec in refresh_options.items()
+                        if sec == st.session_state.refresh_interval), labels[1])
         selected_interval = st.sidebar.selectbox(
             "Refresh interval",
-            options=list(refresh_options.keys()),
-            index=1,
+            options=labels,
+            index=labels.index(current),
             disabled=not st.session_state.auto_refresh
         )
         st.session_state.refresh_interval = refresh_options[selected_interval]
-
-        st.sidebar.caption(f"Last refresh: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
 
     if st.sidebar.button("Refresh Now"):
         fetch_portfolio_from_api.clear()
@@ -287,7 +328,7 @@ def render_sidebar(portfolio: pd.DataFrame, data_source: str):
 
             if st.button("Add Alert"):
                 add_alert(alert_ticker, alert_type, alert_threshold)
-                st.success(f"Alert added for {alert_ticker}")
+                flash(f"Alert added for {alert_ticker}")
                 st.rerun()
 
     alerts = get_alerts()
@@ -329,43 +370,59 @@ def render_holdings_table(portfolio: pd.DataFrame):
     display_df = portfolio[[
         "ticker", "quantity", "entry_price", "platform_price",
         "entry_value", "platform_value", "platform_profit", "platform_growth"
-    ]].copy()
+    ]].rename(columns={
+        "ticker": "Ticker", "quantity": "Qty", "entry_price": "Entry Price",
+        "platform_price": "Current Price", "entry_value": "Entry Value",
+        "platform_value": "Current Value", "platform_profit": "P/L",
+        "platform_growth": "Growth %",
+    })
 
-    display_df.columns = [
-        "Ticker", "Qty", "Entry Price", "Current Price",
-        "Entry Value", "Current Value", "P/L", "Growth %"
-    ]
-
-    for col in ["Entry Price", "Current Price", "Entry Value", "Current Value", "P/L"]:
-        display_df[col] = display_df[col].apply(lambda x: format_currency(x) if pd.notna(x) else "N/A")
-
-    display_df["Growth %"] = display_df["Growth %"].apply(
-        lambda x: format_change(x, is_percent=True) if pd.notna(x) else "N/A"
+    # Keep the values numeric and let Streamlit format them: no per-cell
+    # Python formatting, and columns still sort numerically when clicked.
+    euro = st.column_config.NumberColumn(format="euro")
+    st.dataframe(
+        display_df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Entry Price": euro,
+            "Current Price": euro,
+            "Entry Value": euro,
+            "Current Value": euro,
+            "P/L": euro,
+            "Growth %": st.column_config.NumberColumn(format="%+.2f%%"),
+        },
     )
 
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-
+@st.fragment
 def render_charts_section(portfolio: pd.DataFrame):
-    """Render price charts for each holding."""
+    """
+    Render the price chart for one selected holding.
+
+    st.tabs runs the code for every tab, so the old version fetched history
+    for every ticker on every rerun. Now only the chosen ticker is fetched,
+    and as a fragment, changing ticker/period reruns only this section.
+    """
     st.subheader("Price Charts")
     st.caption("Historical charts from yfinance")
 
-    period = st.selectbox("Chart Period", options=list(CHART_PERIODS.keys()), index=2)
-    period_value = CHART_PERIODS[period]
+    yf_by_label = dict(zip(portfolio["ticker"], portfolio["yf_ticker"]))
+    if not yf_by_label:
+        return
 
-    tickers = portfolio["yf_ticker"].tolist()
-    ticker_labels = portfolio["ticker"].tolist()
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        label = st.selectbox("Ticker", options=list(yf_by_label), key="chart_ticker")
+    with col2:
+        period = st.selectbox("Chart Period", options=list(CHART_PERIODS), index=2, key="chart_period")
 
-    if tickers:
-        tabs = st.tabs(ticker_labels)
-        for tab, ticker, label in zip(tabs, tickers, ticker_labels):
-            with tab:
-                chart = create_price_chart(ticker, period_value)
-                if chart:
-                    st.plotly_chart(chart, use_container_width=True)
-                else:
-                    st.warning(f"Unable to load chart data for {label} ({ticker})")
+    ticker = yf_by_label[label]
+    chart = create_price_chart(ticker, CHART_PERIODS[period])
+    if chart:
+        st.plotly_chart(chart, width="stretch")
+    else:
+        st.warning(f"Unable to load chart data for {label} ({ticker})")
 
 
 def render_allocation_chart(portfolio: pd.DataFrame):
@@ -382,7 +439,7 @@ def render_allocation_chart(portfolio: pd.DataFrame):
     fig.update_traces(textposition="inside", textinfo="percent+label")
     fig.update_layout(height=400)
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_import_export_section(portfolio: pd.DataFrame):
@@ -403,8 +460,7 @@ def render_import_export_section(portfolio: pd.DataFrame):
             if st.button("Import Portfolio", key="import_portfolio_btn"):
                 success, message, _ = import_portfolio_excel(uploaded_portfolio, PORTFOLIO_FILE)
                 if success:
-                    st.success(message)
-                    time.sleep(1)
+                    flash(message)
                     st.rerun()
                 else:
                     st.error(message)
@@ -421,8 +477,7 @@ def render_import_export_section(portfolio: pd.DataFrame):
             if st.button("Import Trades", key="import_trades_btn"):
                 success, message, _ = import_trades_excel(uploaded_trades, TRADES_FILE, merge=merge_trades)
                 if success:
-                    st.success(message)
-                    time.sleep(1)
+                    flash(message)
                     st.rerun()
                 else:
                     st.error(message)
@@ -531,16 +586,21 @@ def render_trades_tab():
         display_df = filtered_df[[
             "timestamp", "ticker", "direction", "price", "quantity", "amount", "fee"
         ]].copy()
-
         display_df.columns = ["Time", "Ticker", "Direction", "Price", "Qty", "Amount", "Fee"]
-
-        display_df["Time"] = display_df["Time"].dt.strftime("%Y-%m-%d %H:%M")
-        display_df["Price"] = display_df["Price"].apply(format_currency)
-        display_df["Amount"] = display_df["Amount"].apply(format_currency)
-        display_df["Fee"] = display_df["Fee"].apply(format_currency)
         display_df["Direction"] = display_df["Direction"].str.upper()
 
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        euro = st.column_config.NumberColumn(format="euro")
+        st.dataframe(
+            display_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Time": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
+                "Price": euro,
+                "Amount": euro,
+                "Fee": euro,
+            },
+        )
 
         # Trade volume chart
         st.subheader("Trade Activity")
@@ -568,7 +628,7 @@ def render_trades_tab():
                 height=300
             )
 
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     # Add new trade section
     st.divider()
@@ -606,8 +666,7 @@ def render_trades_tab():
                 )
 
                 if save_trades(updated_df):
-                    st.success(f"Trade added: {new_direction.upper()} {new_quantity} {new_ticker} @ {format_currency(new_price)}")
-                    time.sleep(1)
+                    flash(f"Trade added: {new_direction.upper()} {new_quantity} {new_ticker} @ {format_currency(new_price)}")
                     st.rerun()
                 else:
                     st.error("Failed to save trade")
@@ -615,25 +674,61 @@ def render_trades_tab():
                 st.error("Please fill in all required fields (Ticker, Price, Quantity)")
 
 
-def render_portfolio_tab(portfolio: pd.DataFrame, data_source: str):
-    """Render the Portfolio tab content."""
-    # Show data source indicator
-    if st.session_state.data_source == "api":
+def render_live_portfolio():
+    """
+    Summary metrics, holdings table and allocation chart.
+
+    Called as a fragment with run_every when auto-refresh is on: Streamlit
+    re-executes only this function on a timer, so the live numbers update
+    without rerunning (and redrawing) the rest of the page.
+    """
+    live = st.session_state.data_source == "api" and API_AVAILABLE
+
+    if live and st.session_state.auto_refresh:
+        elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
+        # Small tolerance: a timer tick can land a few ms before the interval
+        if elapsed >= st.session_state.refresh_interval - 1:
+            fetch_portfolio_from_api.clear()
+            st.session_state.last_refresh = datetime.now()
+
+    try:
+        portfolio, data_source, warning = load_portfolio_data()
+    except Exception:
+        return  # main() already reported the error
+
+    if warning:
+        st.warning(warning)
+    elif live:
         st.success(f"📡 {data_source}")
     else:
         st.info(f"📄 {data_source}")
+
+    if portfolio.empty:
+        return
 
     render_portfolio_summary(portfolio)
 
     st.divider()
 
     col1, col2 = st.columns([2, 1])
-
     with col1:
         render_holdings_table(portfolio)
-
     with col2:
         render_allocation_chart(portfolio)
+
+    if live:
+        st.caption(f"Last refresh: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
+
+
+def render_portfolio_tab(portfolio: pd.DataFrame):
+    """Render the Portfolio tab content."""
+    auto = (st.session_state.data_source == "api" and API_AVAILABLE
+            and st.session_state.auto_refresh)
+    run_every = st.session_state.refresh_interval if auto else None
+
+    # st.fragment can wrap a function at call time, which lets the interval
+    # come from the sidebar setting.
+    st.fragment(render_live_portfolio, run_every=run_every)()
 
     st.divider()
 
@@ -643,28 +738,25 @@ def render_portfolio_tab(portfolio: pd.DataFrame, data_source: str):
 def main():
     """Main application entry point."""
     st.title("Portfolio Monitor")
+    show_flash()
 
-    # Load portfolio data
+    # Load portfolio data (cached) for the sidebar and import/export tab
     try:
-        portfolio, data_source = load_portfolio_data()
+        portfolio, _, _ = load_portfolio_data()
     except FileNotFoundError:
         portfolio = pd.DataFrame()
-        data_source = "No data"
         st.warning(f"Portfolio file not found: {PORTFOLIO_FILE}")
     except Exception as e:
         portfolio = pd.DataFrame()
-        data_source = "Error"
         st.error(f"Error loading portfolio: {e}")
 
-    # Render sidebar
-    render_sidebar(portfolio, data_source)
+    render_sidebar(portfolio)
 
-    # Main content tabs
     tab_portfolio, tab_trades, tab_import_export = st.tabs(["📊 Portfolio", "📈 Trades", "📁 Import/Export"])
 
     with tab_portfolio:
         if not portfolio.empty:
-            render_portfolio_tab(portfolio, data_source)
+            render_portfolio_tab(portfolio)
         else:
             st.info("No portfolio data. Import a portfolio Excel file in the Import/Export tab.")
 
@@ -673,18 +765,6 @@ def main():
 
     with tab_import_export:
         render_import_export_section(portfolio)
-
-    # Auto-refresh logic
-    if st.session_state.data_source == "api" and st.session_state.auto_refresh:
-        time_since_refresh = (datetime.now() - st.session_state.last_refresh).total_seconds()
-        if time_since_refresh >= st.session_state.refresh_interval:
-            st.session_state.last_refresh = datetime.now()
-            fetch_portfolio_from_api.clear()
-            time.sleep(0.5)
-            st.rerun()
-
-        remaining = int(st.session_state.refresh_interval - time_since_refresh)
-        st.caption(f"Next refresh in {remaining} seconds")
 
 
 if __name__ == "__main__":

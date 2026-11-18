@@ -156,44 +156,56 @@ class TrdernetClient:
                 "data": {"tickers": tickers}
             })
 
-    def get_portfolio_sync(self, timeout: float = 10.0) -> Optional[PortfolioData]:
-        """
-        Synchronously fetch portfolio data.
+    REQUEST_TIMEOUT = 10.0  # seconds; without a timeout a stalled request hangs the app
 
-        This is a simplified version that makes a REST API call
-        to get current portfolio state.
+    def _login(self) -> bool:
+        """Log in on the shared HTTP session. Returns True on success."""
+        resp = self._http.post(
+            f"{self.API_URL}/v1/login",
+            json={"login": self.login, "password": self.password},
+            timeout=self.REQUEST_TIMEOUT,
+        )
+        self._logged_in = resp.status_code == 200
+        if not self._logged_in:
+            print(f"Login failed: {resp.status_code}")
+        return self._logged_in
+
+    def get_portfolio_sync(self, timeout: Optional[float] = None) -> Optional[PortfolioData]:
+        """
+        Synchronously fetch portfolio data via the REST API.
+
+        The HTTP session (and its login cookies) is kept on the client, so
+        repeated calls reuse the connection and only log in again when the
+        server rejects the session.
         """
         import requests
 
+        if timeout is not None:
+            self.REQUEST_TIMEOUT = timeout
+
+        if getattr(self, "_http", None) is None:
+            self._http = requests.Session()
+            self._logged_in = False
+
         try:
-            # Try REST API approach first
-            session = requests.Session()
+            for attempt in range(2):
+                if not self._logged_in and not self._login():
+                    return None
 
-            # Login
-            login_resp = session.post(
-                "https://tradernet.com/api/v1/login",
-                json={
-                    "login": self.login,
-                    "password": self.password
-                }
-            )
-
-            if login_resp.status_code != 200:
-                print(f"Login failed: {login_resp.status_code}")
+                resp = self._http.post(
+                    f"{self.API_URL}/v1/portfolio",
+                    json={},
+                    timeout=self.REQUEST_TIMEOUT,
+                )
+                if resp.status_code in (401, 403) and attempt == 0:
+                    self._logged_in = False  # session expired: log in once more
+                    continue
+                if resp.status_code == 200:
+                    return self._parse_portfolio(resp.json())
+                print(f"Portfolio request failed: {resp.status_code}")
                 return None
 
-            login_data = login_resp.json()
-
-            # Get portfolio
-            portfolio_resp = session.post(
-                "https://tradernet.com/api/v1/portfolio",
-                json={}
-            )
-
-            if portfolio_resp.status_code == 200:
-                return self._parse_portfolio(portfolio_resp.json())
-
-        except Exception as e:
+        except requests.RequestException as e:
             print(f"Error fetching portfolio: {e}")
 
         return None
